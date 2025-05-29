@@ -7,6 +7,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.client.HttpClientErrorException;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -83,91 +84,116 @@ public class PdvAccessController {
         return ResponseEntity.ok(resp);
     }
 
-    // ✅ 刷卡开门逻辑，含防抖处理、发币、记录 Tx
-    @GetMapping("/openDoor/{card}")
-    public ResponseEntity<String> openDoor(@PathVariable String card) {
-        long now = System.currentTimeMillis();
-        cardScanTimestamps.put(card, now); // 记录扫码时间
-        try {
-            Thread.sleep(150); // 延迟等待可能更后一次扫码
-        } catch (InterruptedException ignored) {}
+// ✅ 刷卡开门逻辑，含防抖处理、发币、记录 Tx
+@GetMapping("/openDoor/{card}")
+public ResponseEntity<String> openDoor(@PathVariable String card) {
+    long now = System.currentTimeMillis();
+    cardScanTimestamps.put(card, now); // 记录扫码时间
+    try {
+        Thread.sleep(150); // 延迟等待可能更后一次扫码
+    } catch (InterruptedException ignored) {}
 
-        long latest = cardScanTimestamps.getOrDefault(card, 0L);
-        if (now < latest) {
-            logger.info("[OpenDoor] Ignored duplicate scan for card={} at {} (latest={})", card, now, latest);
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body("duplicate");
-        }
-
-        String sid = cardToSessionMap.get(card);
-        if (sid == null) {
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Card not bound");
-        }
-        String userAddr = sessionService.getWalletAddress(sid);
-        if (userAddr == null) {
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("No user wallet");
-        }
-
-        // ✅ 构造交易请求体
-        Map<String,Object> req = new LinkedHashMap<>();
-        req.put("address", userAddr);
-        req.put("value", 1_000_000L);
-
-        Map<String,Object> asset = new LinkedHashMap<>();
-        asset.put("tokenId", PDV_TOKEN_ID);
-        asset.put("amount", 10_000L);
-        req.put("assets", Collections.singletonList(asset));
-        List<Map<String,Object>> payment = Collections.singletonList(req);
-
-        try {
-            // ✅ 解锁钱包
-            String unlockUrl = nodeWalletUrl + "/wallet/unlock";
-            HttpHeaders unlockHeaders = new HttpHeaders();
-            unlockHeaders.setContentType(MediaType.APPLICATION_JSON);
-            Map<String,String> unlockPayload = new HashMap<>();
-            unlockPayload.put("pass", walletPassword);
-            HttpEntity<Map<String,String>> unlockEntity = new HttpEntity<>(unlockPayload, unlockHeaders);
-            restTemplate().postForEntity(unlockUrl, unlockEntity, String.class);
-
-            // ✅ 发送交易请求
-            RestTemplate rt = restTemplate();
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_JSON);
-            HttpEntity<List<Map<String,Object>>> entity = new HttpEntity<>(payment, headers);
-
-            String url = nodeWalletUrl + "/wallet/payment/send";
-            logger.info("[OpenDoor] POST {}", url);
-            logger.info("[OpenDoor] Request body = {}", payment);
-
-            ResponseEntity<String> resp = rt.postForEntity(url, entity, String.class);
-
-            if (resp.getStatusCode().is2xxSuccessful()) {
-                logger.info("[OpenDoor] <<SUCCESS>> Transaction ID: {}", resp.getBody());
-                sessionService.getUserData(sid).setLastTxId(resp.getBody());
-
-                // ✅ 成功后锁钱包
-                try {
-                    String lockUrl = nodeWalletUrl + "/wallet/lock";
-                    HttpHeaders lockHeaders = new HttpHeaders();
-                    lockHeaders.set("accept", "application/json");
-                    HttpEntity<Void> lockEntity = new HttpEntity<>(lockHeaders);
-                    ResponseEntity<String> lockResp = restTemplate().exchange(
-                            lockUrl, HttpMethod.GET, lockEntity, String.class);
-                    logger.info("[WalletLock] lockResp = {}", lockResp.getBody());
-                } catch (Exception ex) {
-                    logger.error("[WalletLock] exception", ex);
-                }
-
-                cardAccessMap.put(card, true);
-                return ResponseEntity.ok("waiting");
-            } else {
-                logger.error("[OpenDoor] node wallet error: {}", resp.getStatusCode());
-                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("payment error");
-            }
-        } catch (Exception ex) {
-            logger.error("[OpenDoor] exception", ex);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("open failed");
-        }
+    long latest = cardScanTimestamps.getOrDefault(card, 0L);
+    if (now < latest) {
+        logger.info("[OpenDoor] Ignored duplicate scan for card={} at {} (latest={})", card, now, latest);
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body("duplicate");
     }
+
+    String sid = cardToSessionMap.get(card);
+    if (sid == null) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Card not bound");
+    }
+    String userAddr = sessionService.getWalletAddress(sid);
+    if (userAddr == null) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("No user wallet");
+    }
+
+    // ✅ 构造交易请求体
+    Map<String,Object> req = new LinkedHashMap<>();
+    req.put("address", userAddr);
+    req.put("value", 1_000_000L);
+
+    Map<String,Object> asset = new LinkedHashMap<>();
+    asset.put("tokenId", PDV_TOKEN_ID);
+    asset.put("amount", 10_000L);
+    req.put("assets", Collections.singletonList(asset));
+    List<Map<String,Object>> payment = Collections.singletonList(req);
+
+    try {
+        // ✅ 判断钱包是否已解锁（未解锁则自动解锁，已解锁则跳过）
+        try {
+            String statusUrl = nodeWalletUrl + "/wallet/status";
+            RestTemplate rt = restTemplate();
+            ResponseEntity<Map> statusResp = rt.getForEntity(statusUrl, Map.class);
+            boolean isUnlocked = Boolean.TRUE.equals(statusResp.getBody().get("unlocked"));
+
+            if (!isUnlocked) {
+                logger.info("[Wallet] Locked. Unlocking now...");
+                String unlockUrl = nodeWalletUrl + "/wallet/unlock";
+                HttpHeaders unlockHeaders = new HttpHeaders();
+                unlockHeaders.setContentType(MediaType.APPLICATION_JSON);
+                Map<String,String> unlockPayload = new HashMap<>();
+                unlockPayload.put("pass", walletPassword);
+                HttpEntity<Map<String,String>> unlockEntity = new HttpEntity<>(unlockPayload, unlockHeaders);
+                try {
+                    rt.postForEntity(unlockUrl, unlockEntity, String.class);
+                    logger.info("[Wallet] Unlocked successfully.");
+                } catch (HttpClientErrorException ex) {
+                    String responseBody = ex.getResponseBodyAsString();
+                    if (ex.getStatusCode() == HttpStatus.BAD_REQUEST && responseBody.contains("Wallet already unlocked")) {
+                        logger.warn("[Wallet] Already unlocked (ignored error).");
+                    } else {
+                        throw ex; // 其他错误照常抛出
+                    }
+                }
+            } else {
+                logger.info("[Wallet] Already unlocked. Skipping unlock step.");
+            }
+        } catch (Exception unlockEx) {
+            logger.error("[WalletUnlock] Failed to check or unlock wallet", unlockEx);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("wallet unlock failed");
+        }
+
+        // ✅ 发送交易请求
+        RestTemplate rt = restTemplate();
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<List<Map<String,Object>>> entity = new HttpEntity<>(payment, headers);
+
+        String url = nodeWalletUrl + "/wallet/payment/send";
+        logger.info("[OpenDoor] POST {}", url);
+        logger.info("[OpenDoor] Request body = {}", payment);
+
+        ResponseEntity<String> resp = rt.postForEntity(url, entity, String.class);
+
+        if (resp.getStatusCode().is2xxSuccessful()) {
+            logger.info("[OpenDoor] <<SUCCESS>> Transaction ID: {}", resp.getBody());
+            sessionService.getUserData(sid).setLastTxId(resp.getBody());
+
+            // ✅ 成功后锁钱包
+            try {
+                String lockUrl = nodeWalletUrl + "/wallet/lock";
+                HttpHeaders lockHeaders = new HttpHeaders();
+                lockHeaders.set("accept", "application/json");
+                HttpEntity<Void> lockEntity = new HttpEntity<>(lockHeaders);
+                ResponseEntity<String> lockResp = restTemplate().exchange(
+                        lockUrl, HttpMethod.GET, lockEntity, String.class);
+                logger.info("[WalletLock] lockResp = {}", lockResp.getBody());
+            } catch (Exception ex) {
+                logger.error("[WalletLock] exception", ex);
+            }
+
+            cardAccessMap.put(card, true);
+            return ResponseEntity.ok("waiting");
+        } else {
+            logger.error("[OpenDoor] node wallet error: {}", resp.getStatusCode());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("payment error");
+        }
+    } catch (Exception ex) {
+        logger.error("[OpenDoor] exception", ex);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("open failed");
+    }
+}
 
     // ✅ 客户端轮询结果
     @GetMapping("/accessStatus/{card}")
