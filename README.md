@@ -84,8 +84,9 @@ Built with ❤️ by [PandaV] (https://www.pandav.io)
 
 [Ergo Platform] (https://ergoplatform.org), using the native ErgoPay protocol for wallet-based authentication and secure access control.
 
+---
 
-PDVServer - ErgoPay 集成服务器
+# PDVServer - ErgoPay 集成服务器
 
 PandaV Access 的后端服务器，使用 ErgoPay 通过 Ergo 钱包进行用户身份验证。
 
